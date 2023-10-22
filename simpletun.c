@@ -1,7 +1,7 @@
 /**************************************************************************
  * simpletun.c                                                            *
  *                                                                        *
- * A simplistic, simple-minded, naive tunnelling program using tun/tap    *
+ * A simplistic, simple-minded, naive tunnelling program using tun        *
  * interfaces and TCP. DO NOT USE THIS PROGRAM FOR SERIOUS PURPOSES.      *
  *                                                                        *
  * You have been warned.                                                  *
@@ -37,7 +37,7 @@
 #include <errno.h>
 #include <stdarg.h>
 
-/* buffer for reading from tun/tap interface, must be >= 1500 */
+/* buffer for reading from tun interface, must be >= 1500 */
 #define BUFSIZE 2000
 #define CLIENT 0
 #define SERVER 1
@@ -46,11 +46,37 @@
 int debug;
 char *progname;
 
+int config_tun(char *dev, int mtu, char *ipv4, char *ipv4_net)
+{
+    char buf[512] = {0};
+
+    printf("tun config -> dev: %s, mtu: %d, ipv4: %s, ipv4_net: %s\n", dev,
+           mtu, ipv4, ipv4_net);
+
+    // 设置mtu
+    memset(buf, 0, sizeof(buf));
+    system(buf);
+    // 设置ipv4地址
+    memset(buf, 0, sizeof(buf));
+    sprintf(buf, "ip addr add %s dev %s", ipv4, dev);
+    system(buf);
+    // 启动网卡
+    memset(buf, 0, sizeof(buf));
+    sprintf(buf, "ip link set dev %s up", dev);
+    system(buf);
+    // 设置路由
+    memset(buf, 0, sizeof(buf));
+    sprintf(buf, "route add -net %s dev %s", ipv4_net, dev);
+    system(buf);
+
+    return 0;
+}
+
 /**************************************************************************
- * tun_alloc: allocates or reconnects to a tun/tap device. The caller     *
+ * tun_alloc: allocates or reconnects to a tun device. The caller         *
  *            must reserve enough space in *dev.                          *
  **************************************************************************/
-int tun_alloc(char *dev, int flags)
+int tun_alloc(int cliserv, char *dev, int flags)
 {
 
     struct ifreq ifr;
@@ -80,6 +106,16 @@ int tun_alloc(char *dev, int flags)
     }
 
     strcpy(dev, ifr.ifr_name);
+
+    // 配置虚拟网卡
+    if (cliserv == SERVER)
+    {
+        config_tun(dev, 1500, "12.12.9.1", "12.12.9.0/24");
+    }
+    else
+    {
+        config_tun(dev, 1500, "12.12.9.2", "12.12.9.0/24");
+    }
 
     return fd;
 }
@@ -177,13 +213,12 @@ void my_err(char *msg, ...)
 void usage(void)
 {
     fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "%s -i <ifacename> [-s|-c <serverIP>] [-p <port>] [-u|-a] [-d]\n", progname);
+    fprintf(stderr, "%s -i <ifacename> [-s|-c <serverIP>] [-p <port>] [-d]\n", progname);
     fprintf(stderr, "%s -h\n", progname);
     fprintf(stderr, "\n");
     fprintf(stderr, "-i <ifacename>: Name of interface to use (mandatory)\n");
     fprintf(stderr, "-s|-c <serverIP>: run in server mode (-s), or specify server address (-c <serverIP>) (mandatory)\n");
     fprintf(stderr, "-p <port>: port to listen on (if run in server mode) or to connect to (in client mode), default 55555\n");
-    fprintf(stderr, "-u|-a: use TUN (-u, default) or TAP (-a)\n");
     fprintf(stderr, "-d: outputs debug information while running\n");
     fprintf(stderr, "-h: prints this help text\n");
     exit(1);
@@ -192,7 +227,7 @@ void usage(void)
 int main(int argc, char *argv[])
 {
 
-    int tap_fd, option;
+    int tun_fd, option;
     int flags = IFF_TUN;
     char if_name[IFNAMSIZ] = "";
     int maxfd;
@@ -209,7 +244,7 @@ int main(int argc, char *argv[])
     progname = argv[0];
 
     /* Check command line options */
-    while ((option = getopt(argc, argv, "i:sc:p:uahd")) > 0)
+    while ((option = getopt(argc, argv, "i:sc:p:hd")) > 0)
     {
         switch (option)
         {
@@ -231,12 +266,6 @@ int main(int argc, char *argv[])
             break;
         case 'p':
             port = atoi(optarg);
-            break;
-        case 'u':
-            flags = IFF_TUN;
-            break;
-        case 'a':
-            flags = IFF_TAP;
             break;
         default:
             my_err("Unknown option %c\n", option);
@@ -269,10 +298,10 @@ int main(int argc, char *argv[])
         usage();
     }
 
-    /* initialize tun/tap interface */
-    if ((tap_fd = tun_alloc(if_name, flags | IFF_NO_PI)) < 0)
+    /* initialize tun interface */
+    if ((tun_fd = tun_alloc(cliserv, if_name, flags | IFF_NO_PI)) < 0)
     {
-        my_err("Error connecting to tun/tap interface %s!\n", if_name);
+        my_err("Error connecting to tun interface %s!\n", if_name);
         exit(1);
     }
 
@@ -344,7 +373,7 @@ int main(int argc, char *argv[])
     }
 
     /* use select() to handle two descriptors at once */
-    maxfd = (tap_fd > net_fd) ? tap_fd : net_fd;
+    maxfd = (tun_fd > net_fd) ? tun_fd : net_fd;
 
     while (1)
     {
@@ -352,7 +381,7 @@ int main(int argc, char *argv[])
         fd_set rd_set;
 
         FD_ZERO(&rd_set);
-        FD_SET(tap_fd, &rd_set);
+        FD_SET(tun_fd, &rd_set);
         FD_SET(net_fd, &rd_set);
 
         ret = select(maxfd + 1, &rd_set, NULL, NULL, NULL);
@@ -368,11 +397,11 @@ int main(int argc, char *argv[])
             exit(1);
         }
 
-        if (FD_ISSET(tap_fd, &rd_set))
+        if (FD_ISSET(tun_fd, &rd_set))
         {
-            /* data from tun/tap: just read it and write it to the network */
+            /* data from tun: just read it and write it to the network */
 
-            nread = cread(tap_fd, buffer, BUFSIZE);
+            nread = cread(tun_fd, buffer, BUFSIZE);
 
             tap2net++;
             do_debug("TAP2NET %lu: Read %d bytes from the tap interface\n", tap2net, nread);
@@ -387,7 +416,7 @@ int main(int argc, char *argv[])
 
         if (FD_ISSET(net_fd, &rd_set))
         {
-            /* data from the network: read it, and write it to the tun/tap interface.
+            /* data from the network: read it, and write it to the tun interface.
              * We need to read the length first, and then the packet */
 
             /* Read length */
@@ -404,8 +433,8 @@ int main(int argc, char *argv[])
             nread = read_n(net_fd, buffer, ntohs(plength));
             do_debug("NET2TAP %lu: Read %d bytes from the network\n", net2tap, nread);
 
-            /* now buffer[] contains a full packet or frame, write it into the tun/tap interface */
-            nwrite = cwrite(tap_fd, buffer, nread);
+            /* now buffer[] contains a full packet or frame, write it into the tun interface */
+            nwrite = cwrite(tun_fd, buffer, nread);
             do_debug("NET2TAP %lu: Written %d bytes to the tap interface\n", net2tap, nwrite);
         }
     }
