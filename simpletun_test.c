@@ -36,6 +36,9 @@
 #include <sys/time.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <poll.h>
+#include <sys/epoll.h>
+#include <pthread.h>
 
 /* buffer for reading from tun interface, must be >= 1500 */
 #define BUFSIZE 2000
@@ -45,109 +48,11 @@
 
 int debug;
 char *progname;
-
-#define VPN_LABEL_LEN 2
-#define RECORD_TYPE_LABEL_LEN 2
-#define RECORD_LENGTH_LABEL_LEN 4
-
-typedef struct
-{
-    int fd;
-    uint8_t net;
-    uint8_t tun;
-} event_data_t;
-
-const unsigned char VPN_LABEL[VPN_LABEL_LEN] = {0x10, 0x10};                                // vpn标记
-const unsigned char RECORD_TYPE_DATA[RECORD_TYPE_LABEL_LEN] = {0x11, 0x10};                 // vpn数据标记
-const unsigned char RECORD_TYPE_CONTROL[RECORD_TYPE_LABEL_LEN] = {0x12, 0x10};              // vpn控制协议标记
-const unsigned char RECORD_TYPE_CONTROL_TUN_CONFIG[RECORD_TYPE_LABEL_LEN] = {0x12, 0x11};   // vpn虚拟网卡配置控制协议
-const unsigned char RECORD_TYPE_CONTROL_ROUTE_CONFIG[RECORD_TYPE_LABEL_LEN] = {0x12, 0x12}; // vpn路由配置控制协议
-const unsigned char RECORD_TYPE_AUTH[RECORD_TYPE_LABEL_LEN] = {0x13, 0x10};                 // vpn认证协议
-const unsigned char RECORD_TYPE_AUTH_ACCOUNT[RECORD_TYPE_LABEL_LEN] = {0x13, 0x11};         // vpn账号认证协议
-const unsigned char RECORD_TYPE_AUTH_PHONE[RECORD_TYPE_LABEL_LEN] = {0x13, 0x12};           // vpn短信认证协议
-const unsigned char RECORD_TYPE_AUTH_TOKEN[RECORD_TYPE_LABEL_LEN] = {0x13, 0x13};           // vpn动态口令认证协议
-const unsigned char RECORD_TYPE_ALARM[RECORD_TYPE_LABEL_LEN] = {0x14, 0x10};                // vpn告警协议
-
-const unsigned int HEADER_LEN = VPN_LABEL_LEN + RECORD_TYPE_LABEL_LEN + RECORD_LENGTH_LABEL_LEN;
-const unsigned int RECORD_HEADER_LEN = RECORD_TYPE_LABEL_LEN + RECORD_LENGTH_LABEL_LEN;
-
-int enpack(const unsigned char type[RECORD_TYPE_LABEL_LEN], unsigned char *in, unsigned int in_len, unsigned char *out, unsigned int *out_len)
-{
-    if (in == NULL || out == NULL || out_len == NULL)
-    {
-        return -1;
-    }
-
-    if (in_len + HEADER_LEN > *out_len)
-    {
-        return -1;
-    }
-
-    int len = 0;
-
-    memcpy(out, VPN_LABEL, VPN_LABEL_LEN);
-    len += VPN_LABEL_LEN;
-    memcpy(out + len, type, RECORD_TYPE_LABEL_LEN);
-    len += RECORD_TYPE_LABEL_LEN;
-    memcpy(out + len, &in_len, RECORD_LENGTH_LABEL_LEN);
-    len += RECORD_LENGTH_LABEL_LEN;
-    memcpy(out + len, in, in_len);
-    len += in_len;
-    *out_len = len;
-
-    return 0;
-}
-
-int depack(unsigned char *in, unsigned int in_len, unsigned char *out, unsigned int *out_len, unsigned char **next, unsigned int *next_len)
-{
-    if (in == NULL || out == NULL || next == NULL || next_len == NULL)
-    {
-        return 0;
-    }
-
-    if (in_len < HEADER_LEN)
-    { // 数据不足消息头长度
-        *next = in;
-        *next_len = in_len;
-        return 0;
-    }
-
-    if (memcmp(in, VPN_LABEL, VPN_LABEL_LEN) == 0)
-    { // 是vpn协议才进行解析
-        unsigned int *length = (unsigned int *)(in + VPN_LABEL_LEN + RECORD_TYPE_LABEL_LEN);
-        if (in_len < (HEADER_LEN + *length))
-        { // 剩余可解析数据长度小于标记长度，需要继续读取
-            *next = in;
-            *next_len = in_len;
-            return 0;
-        }
-
-        if (*out_len < (RECORD_HEADER_LEN + *length))
-        { // 输出缓存数据长度不够
-            *next = in;
-            *next_len = in_len;
-            return 0;
-        }
-
-        memcpy(out, in + VPN_LABEL_LEN, RECORD_HEADER_LEN + *length);
-        *out_len = (RECORD_HEADER_LEN + *length);
-
-        if (in_len == (HEADER_LEN + *length))
-        {
-            // 数据是完整的，没有剩余待解析的数据
-            *next = NULL;
-            *next_len = 0;
-            return 1;
-        }
-        *next = (in + HEADER_LEN + *length);
-        *next_len = (in_len - HEADER_LEN - *length);
-        return 1;
-    }
-    // 不是vpn协议
-    // *next = NULL;
-    *next_len = 0;
-    return -1;
-}
+int epoll_fd;
+int sock_fd;
+int tun_fd;
+// 暂存一个客户端的句柄
+int client_fd;
 
 int config_tun(char *dev, int mtu, char *ipv4, char *ipv4_net)
 {
@@ -310,6 +215,141 @@ void my_err(char *msg, ...)
     va_end(argp);
 }
 
+void addEpollFd(int epollfd, int fd)
+{
+    struct epoll_event ev;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN | EPOLLET;
+    ev.data.fd = fd;
+    int r = epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &ev);
+    if (r)
+    {
+        printf("epoll_ctl add failed[%d], %s", errno, strerror(errno));
+        exit(r);
+    }
+    do_debug("add fd[%d] events: %d\n", fd, ev.events);
+}
+
+int setNonBlock(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0)
+    {
+        return errno;
+    }
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+void handleAccept()
+{
+    struct sockaddr_in raddr;
+    socklen_t rsz = sizeof(raddr);
+    int cfd;
+    while ((cfd = accept4(sock_fd, (struct sockaddr *)&raddr, &rsz, SOCK_CLOEXEC)) >= 0)
+    {
+        struct sockaddr_in peer, local;
+        socklen_t alen = sizeof(peer);
+        int r = getpeername(cfd, (struct sockaddr *)&peer, &alen);
+        if (r < 0)
+        {
+            printf("get peer name failed %d %s\n", errno, strerror(errno));
+            continue;
+        }
+        r = getsockname(cfd, (struct sockaddr *)&local, &alen);
+        if (r < 0)
+        {
+            printf("getsockname failed %d %s\n", errno, strerror(errno));
+            continue;
+        }
+        setNonBlock(cfd);
+        client_fd = cfd;
+
+        // test
+
+        addEpollFd(epoll_fd, cfd);
+        do_debug("accept coonection from client[%d]\n", cfd);
+        break;
+    }
+}
+
+void handlerDataRead(int fd)
+{
+    uint16_t nread, nwrite, plength;
+    char buffer[BUFSIZE];
+
+    /* data from the network: read it, and write it to the tun interface.
+     * We need to read the length first, and then the packet */
+
+    /* Read length */
+    nread = read_n(fd, (char *)&plength, sizeof(plength));
+    if (nread == 0)
+    {
+        /* ctrl-c at the other end */
+        do_debug("Read 0 bytes from network\n");
+        return;
+    }
+
+    /* read packet */
+    nread = read_n(fd, buffer, ntohs(plength));
+    do_debug("Read %d bytes from network\n", nread);
+    /* now buffer[] contains a full packet or frame, write it into the tun interface */
+    nwrite = cwrite(tun_fd, buffer, nread);
+    do_debug("Written %d bytes to tun interface\n", nwrite);
+}
+
+void handleRead(int fd)
+{
+    if (fd == sock_fd)
+    {
+        return handleAccept();
+    }
+    else
+    {
+        return handlerDataRead(fd);
+    }
+}
+
+void handleWrite(int fd)
+{
+    // struct epoll_event ev;
+    // memset(&ev, 0, sizeof(ev));
+    // ev.events = events_;
+    // ev.data.fd = fd;
+    // int r = epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+}
+
+void *server_tun_thread(void *arg)
+{
+    uint16_t nread, nwrite, plength;
+    char buffer[BUFSIZE];
+
+    while (1)
+    {
+        /* data from tun: just read it and write it to the network */
+        nread = cread(tun_fd, buffer, BUFSIZE);
+        do_debug("Read %d bytes from the tun interface\n", nread);
+
+        if (client_fd == 0)
+        {
+            do_debug("no client connect, ignore tun data\n");
+            continue;
+        }
+        /* write length + packet */
+        plength = htons(nread);
+        nwrite = cwrite(client_fd, (char *)&plength, sizeof(plength));
+        nwrite = cwrite(client_fd, buffer, nread);
+        do_debug("Written %d bytes to the network\n", nwrite);
+    }
+}
+
+void tunRead()
+{
+    // 创建server tun读取线程
+    pthread_t serverTunThread;
+    pthread_create(&serverTunThread, NULL, server_tun_thread, NULL);
+}
+
 /**************************************************************************
  * usage: prints usage and exits.                                         *
  **************************************************************************/
@@ -330,18 +370,15 @@ void usage(void)
 int main(int argc, char *argv[])
 {
 
-    int tun_fd, option;
+    int net_fd, option, optval = 1;
     int flags = IFF_TUN;
     char if_name[IFNAMSIZ] = "";
     int maxfd;
-    uint32_t nread, nwrite, plength;
+    uint16_t nread, nwrite, plength;
     char buffer[BUFSIZE];
-    unsigned char packet[BUFSIZE + HEADER_LEN];
-    unsigned int packet_len = sizeof(packet);
     struct sockaddr_in local, remote;
     char remote_ip[16] = ""; /* dotted quad IP string */
     unsigned short int port = PORT;
-    int sock_fd, net_fd, optval = 1;
     socklen_t remotelen;
     int cliserv = -1; /* must be specified on cmd line */
     unsigned long int tap2net = 0, net2tap = 0;
@@ -412,7 +449,7 @@ int main(int argc, char *argv[])
 
     do_debug("Successfully connected to interface %s\n", if_name);
 
-    if ((sock_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+    if ((sock_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0)
     {
         perror("socket()");
         exit(1);
@@ -448,6 +485,7 @@ int main(int argc, char *argv[])
             perror("setsockopt()");
             exit(1);
         }
+        setNonBlock(sock_fd);
 
         memset(&local, 0, sizeof(local));
         local.sin_family = AF_INET;
@@ -466,93 +504,115 @@ int main(int argc, char *argv[])
         }
 
         /* wait for connection request */
-        remotelen = sizeof(remote);
-        memset(&remote, 0, remotelen);
-        if ((net_fd = accept(sock_fd, (struct sockaddr *)&remote, &remotelen)) < 0)
-        {
-            perror("accept()");
-            exit(1);
-        }
+        // create epoll
+        epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+        addEpollFd(epoll_fd, sock_fd);
 
-        do_debug("SERVER: Client connected from %s\n", inet_ntoa(remote.sin_addr));
+        client_fd = 0;
+        tunRead();
+
+        // remotelen = sizeof(remote);
+        // memset(&remote, 0, remotelen);
+        // if ((net_fd = accept(sock_fd, (struct sockaddr *)&remote, &remotelen)) < 0)
+        // {
+        //     perror("accept()");
+        //     exit(1);
+        // }
+
+        // do_debug("SERVER: Client connected from %s\n", inet_ntoa(remote.sin_addr));
     }
 
-    /* use select() to handle two descriptors at once */
-    maxfd = (tun_fd > net_fd) ? tun_fd : net_fd;
-
+    /* use epoll() to handle client connect or data */
     while (1)
     {
-        int ret;
-        fd_set rd_set;
+        const int kMaxEvents = 10240;
+        struct epoll_event activeEvs[kMaxEvents];
 
-        FD_ZERO(&rd_set);
-        FD_SET(tun_fd, &rd_set);
-        FD_SET(net_fd, &rd_set);
-
-        ret = select(maxfd + 1, &rd_set, NULL, NULL, NULL);
-
-        if (ret < 0 && errno == EINTR)
+        int n = epoll_wait(epoll_fd, activeEvs, kMaxEvents, 100);
+        int i;
+        for (i = n - 1; i >= 0; i--)
         {
-            continue;
-        }
-
-        if (ret < 0)
-        {
-            perror("select()");
-            exit(1);
-        }
-
-        if (FD_ISSET(tun_fd, &rd_set))
-        {
-            /* data from tun: just read it and write it to the network */
-            nread = cread(tun_fd, buffer + HEADER_LEN, BUFSIZE - HEADER_LEN);
-            do_debug("TAP2NET %lu: Read %d bytes from the tun interface\n", tap2net, nread);
-
-            tap2net++;
-
-            memcpy(buffer, VPN_LABEL, VPN_LABEL_LEN);
-            memcpy(buffer + VPN_LABEL_LEN, RECORD_TYPE_DATA, RECORD_TYPE_LABEL_LEN);
-            memcpy(buffer + VPN_LABEL_LEN + RECORD_TYPE_LABEL_LEN, &nread, RECORD_LENGTH_LABEL_LEN);
-            // plength = htons(nread);
-            // memcpy(buffer + 2, &plength, sizeof(plength));
-            nwrite = cwrite(net_fd, buffer, nread + HEADER_LEN);
-            if (nwrite != (nread + HEADER_LEN))
+            int fd = activeEvs[i].data.fd;
+            int events = activeEvs[i].events;
+            if (events & (EPOLLIN | EPOLLERR))
             {
-                printf("net read len[%d] != tun write len[%d] + HEADER_LEN[%d]\n", nwrite, nread, HEADER_LEN);
+                do_debug("fd[%d] handle read\n", fd);
+                handleRead(fd);
             }
-            do_debug("TAP2NET %lu: Written %d bytes to the network\n", tap2net, nwrite);
-        }
-
-        if (FD_ISSET(net_fd, &rd_set))
-        {
-            /* data from the network: read it, and write it to the tun interface.
-             * We need to read the length first, and then the packet */
-
-            /* Read length */
-            nread = read_n(net_fd, buffer, HEADER_LEN);
-            if (nread == 0)
+            // else if (events & EPOLLOUT)
+            // {
+            //     printf("fd[%d] handle write\n", fd);
+            //     handleWrite(fd);
+            // }
+            else
             {
-                /* ctrl-c at the other end */
-                break;
+                printf("unknown event %d\n", events);
             }
-            net2tap++;
-            do_debug("NET2TAP %lu: Read %d bytes from the network\n", net2tap, nread);
-
-            // plength = ntohs(*((uint16_t *)(buffer + 2)));
-            plength = *(uint32_t *)(buffer + VPN_LABEL_LEN + RECORD_TYPE_LABEL_LEN);
-            do_debug("NET2TAP %lu: Found %d bytes belong tun\n", net2tap, plength);
-
-            nread = read_n(net_fd, buffer + HEADER_LEN, plength);
-            do_debug("NET2TAP %lu: Read %d bytes from the network\n", net2tap, nread);
-
-            nwrite = cwrite(tun_fd, buffer + HEADER_LEN, nread);
-            if (nwrite != nread)
-            {
-                printf("tun write len[%d] != net read len[%d]\n", nwrite, nread);
-            }
-            do_debug("NET2TAP %lu: Written %d bytes to the tun interface\n", net2tap, nwrite);
         }
     }
+
+    // /* use select() to handle two descriptors at once */
+    // maxfd = (tun_fd > net_fd) ? tun_fd : net_fd;
+    // while (1)
+    // {
+    //     int ret;
+    //     fd_set rd_set;
+
+    //     FD_ZERO(&rd_set);
+    //     FD_SET(tun_fd, &rd_set);
+    //     FD_SET(net_fd, &rd_set);
+
+    //     ret = select(maxfd + 1, &rd_set, NULL, NULL, NULL);
+
+    //     if (ret < 0 && errno == EINTR)
+    //     {
+    //         continue;
+    //     }
+
+    //     if (ret < 0)
+    //     {
+    //         perror("select()");
+    //         exit(1);
+    //     }
+
+    //     if (FD_ISSET(tun_fd, &rd_set))
+    //     {
+    //         /* data from tun: just read it and write it to the network */
+    //         nread = cread(tun_fd, buffer, BUFSIZE);
+    //         tap2net++;
+    //         do_debug("TAP2NET %lu: Read %d bytes from the tap interface\n", tap2net, nread);
+
+    //         /* write length + packet */
+    //         plength = htons(nread);
+    //         nwrite = cwrite(net_fd, (char *)&plength, sizeof(plength));
+    //         nwrite = cwrite(net_fd, buffer, nread);
+
+    //         do_debug("TAP2NET %lu: Written %d bytes to the network\n", tap2net, nwrite);
+    //     }
+
+    //     if (FD_ISSET(net_fd, &rd_set))
+    //     {
+    //         /* data from the network: read it, and write it to the tun interface.
+    //          * We need to read the length first, and then the packet */
+
+    //         /* Read length */
+    //         nread = read_n(net_fd, (char *)&plength, sizeof(plength));
+    //         if (nread == 0)
+    //         {
+    //             /* ctrl-c at the other end */
+    //             break;
+    //         }
+    //         net2tap++;
+
+    //         /* read packet */
+    //         nread = read_n(net_fd, buffer, ntohs(plength));
+    //         do_debug("NET2TAP %lu: Read %d bytes from the network\n", net2tap, nread);
+
+    //         /* now buffer[] contains a full packet or frame, write it into the tun interface */
+    //         nwrite = cwrite(tun_fd, buffer, nread);
+    //         do_debug("NET2TAP %lu: Written %d bytes to the tap interface\n", net2tap, nwrite);
+    //     }
+    // }
 
     return (0);
 }
