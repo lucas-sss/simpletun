@@ -16,6 +16,31 @@
 #include <unistd.h>     //close函数
 #include <fcntl.h>      //设置非阻塞
 
+#include <openssl/bio.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+#define log(...)             \
+    do                       \
+    {                        \
+        printf(__VA_ARGS__); \
+        fflush(stdout);      \
+    } while (0)
+#define check1(x, ...)        \
+    if (x)                    \
+        do                    \
+        {                     \
+            log(__VA_ARGS__); \
+            exit(1);          \
+    } while (0)
+#define check0(x, ...)        \
+    if (!x)                   \
+        do                    \
+        {                     \
+            log(__VA_ARGS__); \
+            exit(1);          \
+    } while (0)
+
 #define BUFSIZE 2000
 #define EVENTS_SIZE 20
 
@@ -51,6 +76,9 @@ int clientfd = -1;
 int tunfd = -1;
 int epollfd = -1;
 int g_stop = 0;
+
+BIO *errBio;
+SSL_CTX *g_sslCtx;
 
 /**************************************************************************
  * do_debug: prints debugging stuff (doh!)                                *
@@ -111,6 +139,16 @@ void dump_hex(const uint8_t *buf, uint32_t size, uint32_t number)
     }
 }
 
+/**
+ * @brief 对数据包进行编码 VPN_LABEL[2] + RECORD_LABEL[2] + DATA_LENGTH[4] + data
+ *
+ * @param type
+ * @param in
+ * @param in_len
+ * @param out
+ * @param out_len
+ * @return int
+ */
 int enpack(const unsigned char type[RECORD_TYPE_LABEL_LEN], unsigned char *in, unsigned int in_len, unsigned char *out, unsigned int *out_len)
 {
     if (in == NULL || out == NULL || out_len == NULL)
@@ -138,6 +176,17 @@ int enpack(const unsigned char type[RECORD_TYPE_LABEL_LEN], unsigned char *in, u
     return 0;
 }
 
+/**
+ * @brief 对数据进行解包
+ *
+ * @param in        输入数据
+ * @param in_len    输入数据长度
+ * @param out       输出数据
+ * @param out_len   输出数据长度
+ * @param next      剩余数据
+ * @param next_len  剩余数据长度
+ * @return int 1解析出数据包，0未解析出数据包，-1非协议数据
+ */
 int depack(unsigned char *in, unsigned int in_len, unsigned char *out, unsigned int *out_len, unsigned char **next, unsigned int *next_len)
 {
     // printf("输入数据长度: %d\n", in_len);
@@ -200,6 +249,130 @@ int depack(unsigned char *in, unsigned int in_len, unsigned char *out, unsigned 
     // 不是vpn协议
     // printf("不是vpn协议\n");
     return -1;
+}
+
+static int verify_callback(int preverify_ok, X509_STORE_CTX *x509_ctx)
+{
+    SSL *ssl;
+    X509 *cert;
+    char *line;
+    printf("verify_callback -> preverify_ok: %d\n", preverify_ok);
+
+    cert = X509_STORE_CTX_get_current_cert(x509_ctx);
+    if (cert != NULL)
+    {
+        printf("客户端证书:\n");
+        line = X509_NAME_oneline(X509_get_subject_name(cert), 0, 0);
+        printf("使用者: %s\n", line);
+        OPENSSL_free(line);
+        line = X509_NAME_oneline(X509_get_issuer_name(cert), 0, 0);
+        printf("颁发者: %s\n", line);
+        OPENSSL_free(line);
+        X509_free(cert);
+    }
+
+    return preverify_ok;
+}
+
+void initSSL()
+{
+    int r;
+    int verifyClient = 0;
+    int useTLS13 = 0;
+    char *ca = "certs/ca.crt";
+    char *signcert = "certs/signcert.crt";
+    char *singkey = "certs/signkey.key";
+    char *enccert = "certs/enccert.crt";
+    char *enckey = "certs/enckey.key";
+    char *cert = "certs/server.pem";
+    char *key = "certs/server.pem";
+    char *crl = "";
+
+    SSL_load_error_strings();
+    r = SSL_library_init();
+    check1(!r, "SSL_library_init failed");
+    errBio = BIO_new_fd(2, BIO_NOCLOSE);
+
+    // 使用SSLv23_method可以同时支持客户同时支持rsa证书和sm2证书，支持普通浏览器和国密浏览器的访问
+    // g_sslCtx = SSL_CTX_new(SSLv23_method());
+    // 双证书相关server的各种定义
+    const SSL_METHOD *meth = NTLS_server_method();
+    g_sslCtx = SSL_CTX_new(meth);
+    check1(g_sslCtx == NULL, "SSL_CTX_new failed");
+
+    // 允许使用国密双证书功能
+    SSL_CTX_enable_ntls(g_sslCtx);
+
+    if (useTLS13)
+    {
+        printf("enable tls13 sm2 sign");
+        // tongsuo中tls1.3不强制签名使用sm2签名，使用开关控制，对应客户端指定密码套件SSL_CTX_set_ciphersuites(ctx, "TLS_SM4_GCM_SM3");
+        SSL_CTX_enable_sm_tls13_strict(g_sslCtx);
+        SSL_CTX_set1_curves_list(g_sslCtx, "SM2:X25519:prime256v1");
+    }
+
+    // 设置密码套件
+    SSL_CTX_set_cipher_list(g_sslCtx, "ECC-SM2-SM4-CBC-SM3:ECDHE-SM2-WITH-SM4-SM3:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA:AES128-GCM-SHA256:AES128-SHA256:AES128-SHA:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA:AES256-GCM-SHA384:AES256-SHA256:AES256-SHA:ECDHE-RSA-AES128-SHA256:!aNULL:!eNULL:!RC4:!EXPORT:!DES:!3DES:!MD5:!DSS:!PKS");
+    SSL_CTX_set_options(g_sslCtx, SSL_OP_CIPHER_SERVER_PREFERENCE);
+
+    // 是否校验客户端
+    if (verifyClient)
+    {
+        printf("need verify client\n");
+        SSL_CTX_set_verify(g_sslCtx, SSL_VERIFY_PEER, verify_callback); // 验证客户端证书回调；
+        // SSL_CTX_set_verify_depth(g_sslCtx, 0);
+        r = SSL_CTX_load_verify_locations(g_sslCtx, ca, NULL);
+        check1(r <= 0, "SSL_CTX_load_verify_locations %s failed", ca);
+        ERR_clear_error();
+        STACK_OF(X509_NAME) *list = SSL_load_client_CA_file(ca);
+        check1(list == NULL, "SSL_load_client_CA_file %s failed", ca);
+        SSL_CTX_set_client_CA_list(g_sslCtx, list);
+    }
+    else
+    {
+        printf("not need verify client\n");
+        SSL_CTX_set_verify(g_sslCtx, SSL_VERIFY_NONE, NULL); // 不验证客户端；
+    }
+
+    if (strlen(crl) > 0)
+    {
+        X509_STORE *store = NULL;
+        X509_LOOKUP *lookup = NULL;
+
+        store = SSL_CTX_get_cert_store(g_sslCtx);
+        check1(store == NULL, "SSL_CTX_get_cert_store() failed");
+
+        lookup = X509_STORE_add_lookup(store, X509_LOOKUP_file());
+        check1(store == NULL, "X509_STORE_add_lookup() failed");
+
+        r = X509_LOOKUP_load_file(lookup, crl, X509_FILETYPE_PEM);
+        check1(store == NULL, "X509_LOOKUP_load_file(\"%s\") failed", crl);
+
+        X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL);
+        printf("local crl finish\n");
+    }
+
+    // 加载sm2证书
+    r = SSL_CTX_use_sign_PrivateKey_file(g_sslCtx, singkey, SSL_FILETYPE_PEM);
+    check1(r <= 0, "SSL_CTX_use_sign_PrivateKey_file %s failed", singkey);
+    r = SSL_CTX_use_sign_certificate_file(g_sslCtx, signcert, SSL_FILETYPE_PEM);
+    check1(r <= 0, "SSL_CTX_use_sign_certificate_file %s failed", signcert);
+    r = SSL_CTX_use_enc_PrivateKey_file(g_sslCtx, enckey, SSL_FILETYPE_PEM);
+    check1(r <= 0, "SSL_CTX_use_enc_PrivateKey_file %s failed", enckey);
+    r = SSL_CTX_use_enc_certificate_file(g_sslCtx, enccert, SSL_FILETYPE_PEM);
+    check1(r <= 0, "SSL_CTX_use_enc_certificate_file %s failed", enccert);
+    printf("load sm2 cert key finish\n");
+
+    // 加载rsa证书
+    r = SSL_CTX_use_certificate_file(g_sslCtx, cert, SSL_FILETYPE_PEM);
+    check1(r <= 0, "SSL_CTX_use_certificate_file %s failed", cert);
+    r = SSL_CTX_use_PrivateKey_file(g_sslCtx, key, SSL_FILETYPE_PEM);
+    check1(r <= 0, "SSL_CTX_use_PrivateKey_file %s failed", key);
+    printf("load rsa cert key finish\n");
+
+    r = SSL_CTX_check_private_key(g_sslCtx);
+    check1(!r, "SSL_CTX_check_private_key failed");
+    printf("SSL inited\n");
 }
 
 void *server_tun_thread(void *arg)
