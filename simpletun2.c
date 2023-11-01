@@ -235,6 +235,10 @@ void *server_tun_thread(void *arg)
         // 5、发消息给客户端
         if (clientfd != -1)
         {
+            /**
+             * @brief 当向socket写失败后（write函数返回值 == -1），注册上 EPOLLOUT 当响应了可写事件后，重新往socket中写数据，写成功后，再取消掉 EPOLLOUT
+             *
+             */
             nwrite = write(clientfd, packet, enpack_len);
             // do_debug("Written %d bytes to the network\n", nwrite);
         }
@@ -453,7 +457,7 @@ int main(int argc, char *argv[])
                 {
                     struct sockaddr_in cli_addr;
                     socklen_t length = sizeof(cli_addr);
-                    // 接受来自socket连接
+                    // 接受来自socket连接, TODO 服务端使用边缘触发，需要连续接收客户端连接，不然会丢失连接
                     int newfd = accept(socketFd, (struct sockaddr *)&cli_addr, &length);
                     if (newfd > 0)
                     {
@@ -480,7 +484,8 @@ int main(int argc, char *argv[])
                         eventdata->net = 1;
 
                         // 设置响应事件,设置可读和边缘(ET)模式
-                        // 很多人会把可写事件(EPOLLOUT)也注册了,后面会解释
+                        // 很多人会把可写事件(EPOLLOUT)也注册了, 如果状态改变了(比如 从满到不满)，只要输出缓冲区可写就会触发
+                        // 如果把可写也注册上，会频繁回调，这里会有很多无用的回调，导致性能下降。
                         memset(&epev, 0, sizeof(epev));
                         epev.events = EPOLLIN;
                         epev.data.fd = newfd;

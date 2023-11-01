@@ -20,6 +20,15 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
+#define BUFSIZE 2000
+#define EVENTS_SIZE 20
+
+#define VPN_LABEL_LEN 2
+#define RECORD_TYPE_LABEL_LEN 2
+#define RECORD_LENGTH_LABEL_LEN 4
+
+#define __is_print(ch) ((unsigned int)((ch) - ' ') < 127u - ' ')
+
 #define log(...)             \
     do                       \
     {                        \
@@ -41,20 +50,14 @@
             exit(1);          \
     } while (0)
 
-#define BUFSIZE 2000
-#define EVENTS_SIZE 20
-
-#define VPN_LABEL_LEN 2
-#define RECORD_TYPE_LABEL_LEN 2
-#define RECORD_LENGTH_LABEL_LEN 4
-
-#define __is_print(ch) ((unsigned int)((ch) - ' ') < 127u - ' ')
-
 typedef struct
 {
     int fd;
     uint8_t net;
     uint8_t tun;
+    int events;
+    SSL *ssl;
+    int sslConnected;
 } event_data_t;
 
 const unsigned char VPN_LABEL[VPN_LABEL_LEN] = {0x10, 0x10};                                // vpn标记
@@ -139,16 +142,6 @@ void dump_hex(const uint8_t *buf, uint32_t size, uint32_t number)
     }
 }
 
-/**
- * @brief 对数据包进行编码 VPN_LABEL[2] + RECORD_LABEL[2] + DATA_LENGTH[4] + data
- *
- * @param type
- * @param in
- * @param in_len
- * @param out
- * @param out_len
- * @return int
- */
 int enpack(const unsigned char type[RECORD_TYPE_LABEL_LEN], unsigned char *in, unsigned int in_len, unsigned char *out, unsigned int *out_len)
 {
     if (in == NULL || out == NULL || out_len == NULL)
@@ -176,17 +169,6 @@ int enpack(const unsigned char type[RECORD_TYPE_LABEL_LEN], unsigned char *in, u
     return 0;
 }
 
-/**
- * @brief 对数据进行解包
- *
- * @param in        输入数据
- * @param in_len    输入数据长度
- * @param out       输出数据
- * @param out_len   输出数据长度
- * @param next      剩余数据
- * @param next_len  剩余数据长度
- * @return int 1解析出数据包，0未解析出数据包，-1非协议数据
- */
 int depack(unsigned char *in, unsigned int in_len, unsigned char *out, unsigned int *out_len, unsigned char **next, unsigned int *next_len)
 {
     // printf("输入数据长度: %d\n", in_len);
@@ -249,6 +231,69 @@ int depack(unsigned char *in, unsigned int in_len, unsigned char *out, unsigned 
     // 不是vpn协议
     // printf("不是vpn协议\n");
     return -1;
+}
+
+void epollFdUpdate(event_data_t *enventdata)
+{
+    printf("epollFdUpdate\n");
+    struct epoll_event ev;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.events = enventdata->events;
+    ev.data.ptr = enventdata;
+    // log("modifying fd %d events read %d write %d\n", fd_, ev.events & EPOLLIN, ev.events & EPOLLOUT);
+    int r = epoll_ctl(epollfd, EPOLL_CTL_MOD, enventdata->fd, &ev);
+    check1(r, "epoll_ctl mod failed %d %s", errno, strerror(errno));
+}
+
+void handshake(event_data_t *eventdata)
+{
+    if (eventdata->ssl == NULL)
+    {
+        eventdata->ssl = SSL_new(g_sslCtx);
+        check1(eventdata->ssl == NULL, "SSL_new failed");
+        int r = SSL_set_fd(eventdata->ssl, eventdata->fd);
+        check1(!r, "SSL_set_fd failed");
+        log("SSL_set_accept_state for fd %d\n", eventdata->fd);
+        SSL_set_accept_state(eventdata->ssl);
+    }
+    int r = SSL_do_handshake(eventdata->ssl);
+    if (r == 1)
+    {
+        // showClientCerts(eventdata->ssl);
+        eventdata->sslConnected = 1;
+        log("new ssl: %p for fd: %d\n", eventdata->ssl, eventdata->fd);
+        return;
+    }
+    int err = SSL_get_error(eventdata->ssl, r);
+    int oldev = eventdata->events;
+    if (err == SSL_ERROR_WANT_WRITE)
+    {
+        eventdata->events |= EPOLLOUT;
+        eventdata->events &= ~EPOLLIN;
+        // log("return want write set events %d\n", ch->events_);
+        if (oldev == eventdata->events)
+            return;
+        epollFdUpdate(eventdata);
+    }
+    else if (err == SSL_ERROR_WANT_READ)
+    {
+        eventdata->events |= EPOLLIN;
+        eventdata->events &= ~EPOLLOUT;
+        // log("return want read set events %d\n", ch->events_);
+        if (oldev == eventdata->events)
+            return;
+        epollFdUpdate(eventdata);
+    }
+    else
+    {
+        log("SSL_do_handshake return %d error %d errno %d msg %s\n", r, err, errno, strerror(errno));
+        ERR_print_errors(errBio);
+        epoll_ctl(epollfd, EPOLL_CTL_DEL, eventdata->fd, NULL);
+        close(eventdata->fd);
+        SSL_shutdown(eventdata->ssl);
+        SSL_free(eventdata->ssl);
+    }
 }
 
 static int verify_callback(int preverify_ok, X509_STORE_CTX *x509_ctx)
@@ -408,6 +453,10 @@ void *server_tun_thread(void *arg)
         // 5、发消息给客户端
         if (clientfd != -1)
         {
+            /**
+             * @brief 当向socket写失败后（write函数返回值 == -1），注册上 EPOLLOUT 当响应了可写事件后，重新往socket中写数据，写成功后，再取消掉 EPOLLOUT
+             *
+             */
             nwrite = write(clientfd, packet, enpack_len);
             // do_debug("Written %d bytes to the network\n", nwrite);
         }
@@ -531,6 +580,9 @@ int main(int argc, char *argv[])
         }
     }
 
+    // 初始化ssl
+    initSSL();
+
     // 创建虚拟网卡
     memcpy(dev, "tun11", sizeof("tun11"));
     tunfd = tun_alloc(dev, IFF_TUN | IFF_NO_PI);
@@ -627,8 +679,8 @@ int main(int argc, char *argv[])
                     struct sockaddr_in cli_addr;
                     socklen_t length = sizeof(cli_addr);
                     // 接受来自socket连接
-                    int newfd = accept(socketFd, (struct sockaddr *)&cli_addr, &length);
-                    if (newfd > 0)
+                    int newfd = 0;
+                    if ((newfd = accept(socketFd, (struct sockaddr *)&cli_addr, &length)) > 0)
                     {
                         // 设置连接为非阻塞模式
                         int flags = fcntl(newfd, F_GETFL, 0);
@@ -651,9 +703,13 @@ int main(int argc, char *argv[])
                         memset(eventdata, 0, sizeof(event_data_t));
                         eventdata->fd = newfd;
                         eventdata->net = 1;
+                        eventdata->ssl = NULL;
+                        eventdata->sslConnected = 0;
+                        eventdata->events = EPOLLIN | EPOLLOUT;
 
                         // 设置响应事件,设置可读和边缘(ET)模式
-                        // 很多人会把可写事件(EPOLLOUT)也注册了,后面会解释
+                        // 很多人会把可写事件(EPOLLOUT)也注册了, 如果状态改变了(比如 从满到不满)，只要输出缓冲区可写就会触发
+                        // 如果把可写也注册上，会频繁回调，这里会有很多无用的回调，导致性能下降。
                         memset(&epev, 0, sizeof(epev));
                         epev.events = EPOLLIN;
                         epev.data.fd = newfd;
@@ -697,7 +753,11 @@ int main(int argc, char *argv[])
                     }
                     do_debug("fd[%d] data comming\n", eventdata->fd);
 
-                    if (eventdata->net == 1)
+                    if (eventdata->sslConnected != 1)
+                    {
+                        handshake(eventdata);
+                    }
+                    else
                     {
                         if (next == NULL)
                         {
@@ -778,32 +838,19 @@ int main(int argc, char *argv[])
                             exit(-1);
                         }
                     }
-
-                    if (eventdata->tun == 1)
-                    { // 网卡可读事件
-                        do_debug("tun data\n");
-
-                        nread = read(tunfd, tun_data, BUFSIZE);
-                        if (nread < 0)
-                        {
-                            printf("tun read error\n");
-                            continue;
-                        }
-                        // do_debug("Read %d bytes from the tun interface\n", nread);
-
-                        enpack_len = sizeof(enpack_buff);
-                        enpack(RECORD_TYPE_DATA, tun_data, (unsigned int)nread, enpack_buff, &enpack_len);
-
-                        if (clientfd != -1)
-                        {
-                            nwrite = write(clientfd, enpack_buff, enpack_len);
-                            // do_debug("Written %d bytes to the network\n", nwrite);
-                        }
-                        else
-                        {
-                            printf("not fond client\n");
-                        }
+                }
+                else if (events[i].events & EPOLLOUT)
+                {
+                    event_data_t *eventdata = (event_data_t *)events[i].data.ptr;
+                    do_debug("fd[%d] can write data\n", eventdata->fd);
+                    if (!eventdata->sslConnected)
+                    {
+                        handshake(eventdata);
+                        continue;
                     }
+                    log("handle write fd %d\n", eventdata->fd);
+                    eventdata->events &= ~EPOLLOUT;
+                    epollFdUpdate(eventdata);
                 }
             }
         }
