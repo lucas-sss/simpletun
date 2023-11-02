@@ -82,6 +82,9 @@ int g_stop = 0;
 
 BIO *errBio;
 SSL_CTX *g_sslCtx;
+SSL *clientssl;
+
+int usessl = 0;
 
 /**************************************************************************
  * do_debug: prints debugging stuff (doh!)                                *
@@ -263,6 +266,7 @@ void handshake(event_data_t *eventdata)
         // showClientCerts(eventdata->ssl);
         eventdata->sslConnected = 1;
         log("new ssl: %p for fd: %d\n", eventdata->ssl, eventdata->fd);
+        clientssl = eventdata->ssl;
         return;
     }
     int err = SSL_get_error(eventdata->ssl, r);
@@ -442,7 +446,7 @@ void *server_tun_thread(void *arg)
         unsigned char dst_ip[4];
         memcpy(dst_ip, &buf[16], 4);
         memcpy(src_ip, &buf[12], 4);
-        // do_debug("read tun data: %d.%d.%d.%d -> %d.%d.%d.%d (%d)\n", dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], src_ip[0], src_ip[1], src_ip[2], src_ip[3], rlen);
+        do_debug("read tun data: %d.%d.%d.%d -> %d.%d.%d.%d (%d)\n", dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], src_ip[0], src_ip[1], src_ip[2], src_ip[3], rlen);
 
         // 3、对数据进行封包处理
         enpack_len = sizeof(packet);
@@ -453,12 +457,20 @@ void *server_tun_thread(void *arg)
         // 5、发消息给客户端
         if (clientfd != -1)
         {
-            /**
-             * @brief 当向socket写失败后（write函数返回值 == -1），注册上 EPOLLOUT 当响应了可写事件后，重新往socket中写数据，写成功后，再取消掉 EPOLLOUT
-             *
-             */
-            nwrite = write(clientfd, packet, enpack_len);
-            // do_debug("Written %d bytes to the network\n", nwrite);
+            if (usessl)
+            {
+                nwrite = SSL_write(clientssl, packet, enpack_len);
+            }
+            else
+            {
+                nwrite = write(clientfd, packet, enpack_len);
+            }
+            do_debug("Written %d bytes to the network\n", nwrite);
+            // 当向socket写失败后（write函数返回值 == -1），注册上 EPOLLOUT 当响应了可写事件后，重新往socket中写数据，写成功后，再取消掉 EPOLLOUT
+            if (nwrite != enpack_len) // TODO
+            {
+                printf("net write len < enpack_len\n");
+            }
         }
         else
         {
@@ -564,10 +576,13 @@ int main(int argc, char *argv[])
     // signal(SIGINT, handleInterrupt);
 
     /* Check command line options */
-    while ((option = getopt(argc, argv, "hd")) > 0)
+    while ((option = getopt(argc, argv, "ehd")) > 0)
     {
         switch (option)
         {
+        case 'e':
+            usessl = 1;
+            break;
         case 'd':
             debug = 1;
             break;
@@ -580,8 +595,11 @@ int main(int argc, char *argv[])
         }
     }
 
-    // 初始化ssl
-    initSSL();
+    if (usessl)
+    {
+        // 初始化ssl
+        initSSL();
+    }
 
     // 创建虚拟网卡
     memcpy(dev, "tun11", sizeof("tun11"));
@@ -753,7 +771,7 @@ int main(int argc, char *argv[])
                     }
                     do_debug("fd[%d] data comming\n", eventdata->fd);
 
-                    if (eventdata->sslConnected != 1)
+                    if (usessl && eventdata->sslConnected != 1)
                     {
                         handshake(eventdata);
                     }
@@ -774,7 +792,42 @@ int main(int argc, char *argv[])
                         int l = BUFSIZE - nextlen;
                         do_debug("client data -> next: %p, nextlen: %d, next偏移量: %d, 可用空间size: %d\n", next, nextlen, next - buff, l);
 
-                        int len = read(eventdata->fd, next + nextlen, BUFSIZE - nextlen);
+                        int len;
+                        if (usessl)
+                        {
+                            len = SSL_read(eventdata->ssl, next + nextlen, BUFSIZE - nextlen);
+                            int ssle = SSL_get_error(eventdata->ssl, len);
+                            if (len < 0)
+                            {
+                                if (ssle == SSL_ERROR_WANT_READ)
+                                {
+                                    continue;
+                                }
+                                if (errno != EAGAIN)
+                                {
+                                    log("SSL_read return %d, error: %d, errno: %d, msg: %s\n", len, ssle, errno, strerror(errno));
+                                    epoll_ctl(eFd, EPOLL_CTL_DEL, eventdata->fd, NULL);
+                                    close(eventdata->fd);
+                                    free(eventdata);
+                                }
+                                continue;
+                            }
+                            if (len == 0)
+                            {
+                                if (ssle == SSL_ERROR_ZERO_RETURN)
+                                    log("SSL has been shutdown.\n");
+                                else
+                                    log("Connection has been aborted.\n");
+                                epoll_ctl(eFd, EPOLL_CTL_DEL, eventdata->fd, NULL);
+                                close(eventdata->fd);
+                                free(eventdata);
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            len = read(eventdata->fd, next + nextlen, BUFSIZE - nextlen);
+                        }
                         do_debug("read client data len: %d\n", len);
 
                         // 如果读取数据出错,关闭并从epoll中删除连接
@@ -790,6 +843,7 @@ int main(int argc, char *argv[])
                             printf("read error, client out fd: %d\n", eventdata->fd);
                             epoll_ctl(eFd, EPOLL_CTL_DEL, eventdata->fd, NULL);
                             close(eventdata->fd);
+                            free(eventdata);
                             continue;
                         }
 
@@ -843,13 +897,13 @@ int main(int argc, char *argv[])
                 {
                     event_data_t *eventdata = (event_data_t *)events[i].data.ptr;
                     do_debug("fd[%d] can write data\n", eventdata->fd);
-                    if (!eventdata->sslConnected)
+                    if (usessl && !eventdata->sslConnected)
                     {
-                        handshake(eventdata);
+                        handshake(eventdata); // 可写时间再进主动进行握手
                         continue;
                     }
                     log("handle write fd %d\n", eventdata->fd);
-                    eventdata->events &= ~EPOLLOUT;
+                    eventdata->events &= ~EPOLLOUT; // 已经握手成功就不需要监听EPOLLOUT
                     epollFdUpdate(eventdata);
                 }
             }

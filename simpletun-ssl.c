@@ -26,8 +26,8 @@
 #include <unistd.h>
 #include <net/if.h>
 #include <linux/if_tun.h>
-#include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -82,6 +82,7 @@ typedef struct
     uint8_t tun;
 } event_data_t;
 
+int usessl = 0;
 int useTLS13 = 0;
 int useDHE = 0;
 int verifyClient = 0;
@@ -343,13 +344,10 @@ void my_err(char *msg, ...)
 SSL_CTX *createClientSslCtx()
 {
     int ret = 0;
+
     // 变量定义
     const SSL_METHOD *meth = NULL;
     SSL_CTX *ctx = NULL;
-    const char *sign_key_file = "certs/signclient.key";
-    const char *sign_cert_file = "certs/signclient.crt";
-    const char *enc_key_file = "certs/encclient.key";
-    const char *enc_cert_file = "certs/encclient.crt";
 
     // 双证书相关client的各种定义
     meth = NTLS_client_method();
@@ -358,57 +356,14 @@ SSL_CTX *createClientSslCtx()
     // 允许使用国密双证书功能
     SSL_CTX_enable_ntls(ctx);
 
-    if (useTLS13)
-    {
-        // 对于tls1.3: 设置算法套件为TLS_SM4_GCM_SM3/TLS_SM4_CCM_SM3
-        SSL_CTX_set1_curves_list(ctx, "SM2:X25519:prime256v1");
-        ret = SSL_CTX_set_ciphersuites(ctx, "TLS_SM4_GCM_SM3");
-    }
-    else
-    {
-        // 对于tlcp: 设置算法套件为ECC-SM2-WITH-SM4-SM3或者ECDHE-SM2-WITH-SM4-SM3,
-        // 这一步并不强制编写，默认ECC-SM2-WITH-SM4-SM3优先
-        if (useDHE)
-        {
-            printf("use ECDHE-SM2-WITH-SM4-SM3\n");
-            ret = SSL_CTX_set_cipher_list(ctx, "ECDHE-SM2-WITH-SM4-SM3");
-            // 加载签名证书，加密证书，仅ECDHE-SM2-WITH-SM4-SM3套件需要这一步,
-            // 该部分流程用...begin...和...end...注明
-            //  ...begin...
-            if (!SSL_CTX_use_sign_PrivateKey_file(ctx, sign_key_file, SSL_FILETYPE_PEM))
-            {
-                goto err;
-            }
-            if (!SSL_CTX_use_sign_certificate_file(ctx, sign_cert_file, SSL_FILETYPE_PEM))
-            {
-                goto err;
-            }
-            if (!SSL_CTX_use_enc_PrivateKey_file(ctx, enc_key_file, SSL_FILETYPE_PEM))
-            {
-                goto err;
-            }
-            if (!SSL_CTX_use_enc_certificate_file(ctx, enc_cert_file, SSL_FILETYPE_PEM))
-            {
-                goto err;
-            }
-            // ...end...
-        }
-        else
-        {
-            printf("use ECC-SM2-WITH-SM4-SM3\n");
-            ret = SSL_CTX_set_cipher_list(ctx, "ECC-SM2-WITH-SM4-SM3");
-        }
-    }
-
+    printf("use ECC-SM2-WITH-SM4-SM3\n");
+    ret = SSL_CTX_set_cipher_list(ctx, "ECC-SM2-WITH-SM4-SM3");
     if (ret <= 0)
     {
         printf("SSL_CTX_set_cipher_list fail\n");
-        goto err;
+        exit(1);
     }
     return ctx;
-err:
-    SSL_CTX_free(ctx);
-    return NULL;
 }
 
 static int verify_callback(int preverify_ok, X509_STORE_CTX *x509_ctx)
@@ -548,6 +503,7 @@ void usage(void)
     fprintf(stderr, "-s|-c <serverIP>: run in server mode (-s), or specify server address (-c <serverIP>) (mandatory)\n");
     fprintf(stderr, "-p <port>: port to listen on (if run in server mode) or to connect to (in client mode), default 55555\n");
     fprintf(stderr, "-d: outputs debug information while running\n");
+    fprintf(stderr, "-e: use ssl\n");
     fprintf(stderr, "-h: prints this help text\n");
     exit(1);
 }
@@ -577,7 +533,7 @@ int main(int argc, char *argv[])
     progname = argv[0];
 
     /* Check command line options */
-    while ((option = getopt(argc, argv, "i:sc:p:hd")) > 0)
+    while ((option = getopt(argc, argv, "i:sc:p:hde")) > 0)
     {
         switch (option)
         {
@@ -599,6 +555,9 @@ int main(int argc, char *argv[])
             break;
         case 'p':
             port = atoi(optarg);
+            break;
+        case 'e':
+            usessl = 1;
             break;
         default:
             my_err("Unknown option %c\n", option);
@@ -650,40 +609,69 @@ int main(int argc, char *argv[])
     {
         /* Client, try to connect to server */
 
-        /* assign the destination address */
-        memset(&remote, 0, sizeof(remote));
-        remote.sin_family = AF_INET;
-        remote.sin_addr.s_addr = inet_addr(remote_ip);
-        remote.sin_port = htons(port);
+        // /* assign the destination address */
+        // memset(&remote, 0, sizeof(remote));
+        // remote.sin_family = AF_INET;
+        // remote.sin_addr.s_addr = inet_addr(remote_ip);
+        // remote.sin_port = htons(port);
 
-        /* connection request */
-        if (connect(sock_fd, (struct sockaddr *)&remote, sizeof(remote)) < 0)
+        // /* connection request */
+        // if (connect(sock_fd, (struct sockaddr *)&remote, sizeof(remote)) < 0)
+        // {
+        //     perror("connect()");
+        //     exit(1);
+        // }
+
+        /* 创建一个 socket 用于 tcp 通信 */
+        if ((sock_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
         {
-            perror("connect()");
-            exit(1);
+            perror("Socket");
+            exit(errno);
+        }
+        printf("socket created\n");
+
+        /* 初始化服务器端（对方）的地址和端口信息 */
+        bzero(&remote, sizeof(remote));
+        remote.sin_family = AF_INET;
+        remote.sin_port = htons(port);
+        if (inet_aton(remote_ip, (struct in_addr *)&remote.sin_addr.s_addr) == 0)
+        {
+            perror(argv[1]);
+            exit(errno);
+        }
+
+        printf("address created\n");
+
+        /* 连接服务器 */
+        if (connect(sock_fd, (struct sockaddr *)&remote, sizeof(remote)) != 0)
+        {
+            perror("Connect ");
+            exit(errno);
         }
 
         net_fd = sock_fd;
         do_debug("CLIENT: Connected to server %s\n", inet_ntoa(remote.sin_addr));
 
-        /* 基于 ctx 产生一个新的 SSL */
-        ctx = createClientSslCtx();
-        if (ctx = NULL)
+        if (usessl)
         {
-            printf("createClientSslCtx() fail\n");
-            exit(1);
-        }
-        printf("createClientSslCtx() success\n");
-        ssl = SSL_new(ctx);
-        SSL_set_fd(ssl, sock_fd);
+            /* 基于 ctx 产生一个新的 SSL */
+            ctx = createClientSslCtx();
+            ssl = SSL_new(ctx);
+            SSL_set_fd(ssl, sock_fd);
 
-        /* 建立 SSL 连接 */
-        if (SSL_connect(ssl) == -1)
-        {
-            perror("SSL_connect()");
-            exit(1);
+            /* 建立 SSL 连接 */
+            if (SSL_connect(ssl) == -1)
+            {
+                ERR_print_errors_fp(stderr);
+                exit(errno);
+            }
+            else
+            {
+                printf("密码套件: %s\n", SSL_get_cipher(ssl));
+                // ShowCerts(ssl);
+            }
+            printf("SSL_connect finish\n");
         }
-        printf("SSL_connect finish\n");
     }
     else
     {
@@ -760,9 +748,15 @@ int main(int argc, char *argv[])
             memcpy(buffer, VPN_LABEL, VPN_LABEL_LEN);
             memcpy(buffer + VPN_LABEL_LEN, RECORD_TYPE_DATA, RECORD_TYPE_LABEL_LEN);
             memcpy(buffer + VPN_LABEL_LEN + RECORD_TYPE_LABEL_LEN, &nread, RECORD_LENGTH_LABEL_LEN);
-            // plength = htons(nread);
-            // memcpy(buffer + 2, &plength, sizeof(plength));
-            nwrite = cwrite(net_fd, buffer, nread + HEADER_LEN);
+
+            if (usessl)
+            {
+                nwrite = SSL_write(ssl, buffer, nread + HEADER_LEN);
+            }
+            else
+            {
+                nwrite = cwrite(net_fd, buffer, nread + HEADER_LEN);
+            }
             if (nwrite != (nread + HEADER_LEN))
             {
                 printf("net read len[%d] != tun write len[%d] + HEADER_LEN[%d]\n", nwrite, nread, HEADER_LEN);
@@ -776,7 +770,36 @@ int main(int argc, char *argv[])
              * We need to read the length first, and then the packet */
 
             /* Read length */
-            nread = read_n(net_fd, buffer, HEADER_LEN);
+            if (usessl)
+            {
+                nread = SSL_read(ssl, buffer, HEADER_LEN);
+                int ssle = SSL_get_error(ssl, nread);
+                if (nread < 0)
+                {
+                    if (ssle == SSL_ERROR_WANT_READ)
+                    {
+                        continue;
+                    }
+                    if (errno != EAGAIN)
+                    {
+                        log("SSL_read return %d, error: %d, errno: %d, msg: %s\n", nread, ssle, errno, strerror(errno));
+                        break;
+                    }
+                    continue;
+                }
+                if (nread == 0)
+                {
+                    if (ssle == SSL_ERROR_ZERO_RETURN)
+                        log("SSL has been shutdown.\n");
+                    else
+                        log("Connection has been aborted.\n");
+                    break;
+                }
+            }
+            else
+            {
+                nread = read_n(net_fd, buffer, HEADER_LEN);
+            }
             if (nread == 0)
             {
                 /* ctrl-c at the other end */
@@ -789,7 +812,14 @@ int main(int argc, char *argv[])
             plength = *(uint32_t *)(buffer + VPN_LABEL_LEN + RECORD_TYPE_LABEL_LEN);
             do_debug("NET2TAP %lu: Found %d bytes belong tun\n", net2tap, plength);
 
-            nread = read_n(net_fd, buffer + HEADER_LEN, plength);
+            if (usessl)
+            {
+                nread = SSL_read(ssl, buffer + HEADER_LEN, plength);
+            }
+            else
+            {
+                nread = read_n(net_fd, buffer + HEADER_LEN, plength);
+            }
             do_debug("NET2TAP %lu: Read %d bytes from the network\n", net2tap, nread);
 
             nwrite = cwrite(tun_fd, buffer + HEADER_LEN, nread);
