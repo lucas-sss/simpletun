@@ -426,11 +426,14 @@ void initSSL()
 
 void *server_tun_thread(void *arg)
 {
+    int i = 1;
+    int n = 0;
     size_t rlen = 0;
     unsigned char buf[BUFSIZE];
     unsigned char packet[BUFSIZE + HEADER_LEN];
     unsigned int enpack_len = 0, nwrite = 0;
-
+    unsigned char bigbuff[BUFSIZE * n + HEADER_LEN * n];
+    unsigned int copylen = 0;
     // 2、读取虚拟网卡数据
     while (1)
     {
@@ -441,6 +444,7 @@ void *server_tun_thread(void *arg)
             printf("tun read len < 0\n");
             break;
         }
+        do_debug("tun read len: %d\n", rlen);
         // 2、分析报文
         unsigned char src_ip[4];
         unsigned char dst_ip[4];
@@ -457,14 +461,29 @@ void *server_tun_thread(void *arg)
         // 5、发消息给客户端
         if (clientfd != -1)
         {
+            memcpy(bigbuff + copylen, packet, enpack_len);
+            copylen += enpack_len;
+            if (i % (n + 1) != 0)
+            {
+                do_debug("积攒数据: %d\n", enpack_len);
+                i++;
+                continue;
+            }
+            do_debug("发送数据:  %d\n", copylen);
+
             if (usessl)
             {
-                nwrite = SSL_write(clientssl, packet, enpack_len);
+                // nwrite = SSL_write(clientssl, packet, enpack_len);
+                nwrite = SSL_write(clientssl, bigbuff, copylen);
             }
             else
             {
-                nwrite = write(clientfd, packet, enpack_len);
+                // nwrite = write(clientfd, packet, enpack_len);
+                nwrite = write(clientfd, bigbuff, copylen);
             }
+            copylen = 0;
+            i = 1;
+
             do_debug("Written %d bytes to the network\n", nwrite);
             // 当向socket写失败后（write函数返回值 == -1），注册上 EPOLLOUT 当响应了可写事件后，重新往socket中写数据，写成功后，再取消掉 EPOLLOUT
             if (nwrite != enpack_len) // TODO
