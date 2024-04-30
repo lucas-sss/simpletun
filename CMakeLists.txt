@@ -21,6 +21,12 @@ target_link_libraries(simpletun2 pthread ssl crypto)
 add_executable(simpletun3 simpletun3.c)
 target_link_libraries(simpletun3 pthread ssl crypto)
 
+add_executable(mmapsocket mmapsocket.c)
+target_link_libraries(mmapsocket)
+
+add_executable(test test.c)
+target_link_libraries(test pthread)
+
 # 拷贝文件夹到指定的目录
 add_custom_target(
   copy_certs ALL

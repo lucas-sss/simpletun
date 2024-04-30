@@ -1,0 +1,12 @@
+ip tuntap add dev tun11 mod tun
+ip addr add 12.12.9.1 dev tun11
+ip link set dev tun11 up
+route add -net 12.12.9.0/24 dev tun11
+
+
+ip tuntap add dev tun11 mod tun
+ip addr add 12.12.9.2 dev tun11
+ip link set dev tun11 up
+route add -net 12.12.9.0/24 dev tun11
+
+ip tuntap del dev tun11 mod tun
